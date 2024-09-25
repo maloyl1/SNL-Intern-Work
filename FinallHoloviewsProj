@@ -1,0 +1,192 @@
+import numpy as np
+import time
+import sys
+from netCDF4 import Dataset
+
+import shapely
+import pyarrow as pa
+import spatialpandas
+import cartopy.crs as ccrs
+import matplotlib
+import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
+
+import holoviews as hv
+import geoviews as gv
+import datashader as ds
+from PIL import Image
+
+def shift_anti_meridian_polygons(lon_poly_coords, lat_poly_coords, eps=40):
+    polygons = np.stack((lon_poly_coords, lat_poly_coords), axis=2)
+    diff = np.array(np.max(polygons[:,:,0], axis=1) - np.min(polygons[:,:,0], axis=1) > eps)
+    lon_coord_mask = polygons[:,:,0] < eps
+    lon_coord_mask[~diff,:] = 0
+
+    polygons[lon_coord_mask,0] = polygons[lon_coord_mask,0] + 360
+    return polygons
+
+
+def polygons_to_geodataframe(lon_poly_coords, lat_poly_coords, data, eps=10):
+    polygons = shift_anti_meridian_polygons(lon_poly_coords, lat_poly_coords)
+    geo = shapely.polygons(polygons)
+
+    arr_flat, part_indices = shapely.get_parts(geo, return_index=True)
+    offsets1 = np.insert(np.bincount(part_indices).cumsum(), 0, 0)
+    arr_flat2, ring_indices = shapely.get_rings(arr_flat, return_index=True)
+    offsets2 = np.insert(np.bincount(ring_indices).cumsum(), 0, 0)
+    coords, indices = shapely.get_coordinates(arr_flat2, return_index=True)
+    offsets3 = np.insert(np.bincount(indices).cumsum(), 0, 0)
+    coords_flat = coords.ravel()
+    offsets3 *= 2
+
+    _parr3 = pa.ListArray.from_arrays(pa.array(offsets3), pa.array(coords_flat))
+    _parr2 = pa.ListArray.from_arrays(pa.array(offsets2), _parr3)
+    parr = pa.ListArray.from_arrays(pa.array(offsets1), _parr2)
+
+    polygons = spatialpandas.geometry.MultiPolygonArray(parr)
+    gdf = spatialpandas.GeoDataFrame({'geometry': polygons})
+    gdf = gdf.assign(faces = data)
+    return gdf
+
+# Background img setup
+#Low res img
+#image_path = '/ascldap/users/ljmaloy/holo/land_shallow_topo_2048.jpg'
+
+#Highres img
+image_path = '3_no_ice_clouds_8k-final-V2-9-1-2015.png'
+img = Image.open(image_path)
+img_data = np.array(img)
+img_data_flipped = np.flipud(img_data)
+bounds = (-180, -90, 180, 90)  # Assuming the image covers the whole globe
+
+# Create gv.RGB object for the background image
+gv_rgb = gv.RGB((np.linspace(-180, 180, img_data_flipped.shape[1]),
+                 np.linspace(-90, 90, img_data_flipped.shape[0]),
+                 img_data_flipped[..., 0], img_data_flipped[..., 1], img_data_flipped[..., 2]),
+                 bounds=bounds)
+
+# read in polygons from scrip file:
+#Script for SW
+name="/ascldap/users/ljmaloy/hd/TEMPEST_ne1024pg2.scrip.nc"
+
+#Script for SP
+#name="/ascldap/users/ljmaloy/holo/TEMPEST_ne30pg2.scrip.nc"
+
+# Read in the new data file
+#Shortwave flux up top of model data pack
+name2 = "output.scream.TOMVars.INSTANT.nmins_x15.2020-01-22-00900.nc"
+
+#Surface Pressure datafile
+#name2 ="/ascldap/users/ljmaloy/holo/F2010x6t-a.PSandTBOT.nc"
+file2 = Dataset(name2, "r")
+ncols2 = file2.dimensions["ncol"].size
+filevar = file2.variables["SW_flux_up@tom"][75,:]
+#filevar = file2.variables["PS"][5,:]
+#range 1-
+
+file1 = Dataset(name,"r")
+ncols = file1.dimensions["grid_size"].size
+print("ncols = ",ncols)
+xlat = file1.variables["grid_corner_lat"][:,:]
+xlon = file1.variables["grid_corner_lon"][:,:]
+area = file1.variables["grid_area"][:]
+if "adian" in file1.variables["grid_corner_lat"].units:
+    xlat *= 180/np.pi
+    xlon *= 180/np.pi
+
+if ncols != ncols2:
+   print("error datafile ncols doesnt match scriptfile ncols")
+   sys.exit(1)
+
+
+mn = float(min(filevar))
+mx = float(max(filevar))
+clev = (mn, mx)
+colormap = 'Greys_r'  # Changed from 'Spectral'
+print(f"poly_plot(): plotting {len(area)} cells. data min/max= {mn:.3},{mx:.3}")
+
+# Create the custom reversed grayscale colormap
+cmap = plt.get_cmap("Greys_r")(np.linspace(0, 1, 256))
+
+# Create the custom reversed grayscale colormap
+cmap = plt.get_cmap("Greys_r")(np.linspace(0, 1, 256))
+cmap[:64, 3] = 0.75
+#for i, color in enumerate(cmap):
+#	print(f"Color {i}: {color}")
+custom_cmap = mcolors.ListedColormap(cmap)
+
+# Define regions with their central longitudes and latitudes
+regions = {
+    "America": {"central_longitude": -100, "central_latitude": 0},
+    "Europe": {"central_longitude": 10, "central_latitude": 50},
+    "Asia": {"central_longitude": 100, "central_latitude": 30},
+    "Pacific_Ocean": {"central_longitude": -160, "central_latitude": 0},
+    "Africa": {"central_longitude": 20, "central_latitude": 0},
+    "Atlantic_Ocean": {"central_longitude": -30, "central_latitude": 0},
+    "Antarctica": {"central_longitude": 0, "central_latitude": -90},
+}
+
+
+# Select the desired region
+# Change this to "Europe", "Asia", "Pacific Ocean", "Africa","Antartica" ,or "Atlantic Ocean" as needed
+selected_region = "America"
+
+# center plot at the selected region:
+proj = ccrs.Orthographic(central_longitude=regions[selected_region]["central_longitude"],
+                         central_latitude=regions[selected_region]["central_latitude"])
+xpoly = proj.transform_points(proj, xlon, xlat)
+
+# convert polygons go geodataframe (for holoviews routines)
+xlon = xpoly[:,:,0]
+xlat = xpoly[:,:,1]
+
+# holoviews resolution:
+#height = 800 # for quick dev
+#width = 1600
+# mpl resolution:
+#dpi = 300    # only used by MPL direct code. dpi=300 results in  1548x804 image
+#Default High res
+height = 3200
+width = 6400
+
+#Super high res
+#height = 6400
+#width = 12800
+
+#Ultra res
+#height = 12800
+#width = 25600
+
+# bump up the resolution:
+#height = 4 * height
+#width = 4 * width
+#dpi = 4 * dpi
+
+# global plot
+xlim = (-180., 180.)
+ylim = (-90., 90.)
+gv.extension('matplotlib')
+gdf = polygons_to_geodataframe(np.ma.getdata(xlon), np.ma.getdata(xlat), np.ma.getdata(filevar))
+hv_polys = gv.Polygons(gdf, vdims=['faces'])
+hv_polys.opts(color='faces')
+hv_polys.opts(colorbar=True)
+
+# Set the font size globally
+#plt.rcParams.update({'font.size': 80}) # Adjust the number to your desired font size
+
+r = hv.operation.datashader.rasterize(hv_polys, width=width, height=height)
+r = r.opts(clim=(clev),
+cmap=custom_cmap,
+data_aspect=1,
+projection=ccrs.Orthographic(central_longitude=regions[selected_region]["central_longitude"],
+central_latitude=regions[selected_region]["central_latitude"]),
+global_extent=True,
+xaxis=None,
+yaxis=None,
+fig_inches=10,
+# colorbar=True,
+)
+
+fig = gv.render(gv_rgb * r) # adding dpi here doesn't change anything, width not accepted
+fig.set_size_inches(20, 10) # Set the figure size to be larger
+fig.savefig(f"{selected_region}A5_GLOBE.png", bbox_inches='tight', dpi=300) # Save with higher DPI
